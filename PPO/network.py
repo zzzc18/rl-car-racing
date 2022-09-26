@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 import torchvision
+import torch.nn.functional as F
 
 
 class CarRacingModel(nn.Module):
@@ -46,6 +47,48 @@ class CarRacingModel(nn.Module):
         x = self.head_value(x)
         return x
 
+
+class CarRacingModelSmooth(nn.Module):
+    def __init__(self) -> None:
+        super().__init__()
+        self.conv1 = nn.Conv2d(
+            in_channels=3, out_channels=32, kernel_size=7, padding=3, stride=2)  # 96x96x3->48x48x32
+        self.pool1 = nn.MaxPool2d(
+            kernel_size=2, stride=2)  # 48x48x32->24x24x32
+        self.conv2 = nn.Conv2d(
+            in_channels=32, out_channels=32, kernel_size=5, padding=2, stride=2)  # 24x24x32->12x12x32
+        self.conv3 = nn.Conv2d(in_channels=32, out_channels=64,
+                               kernel_size=3, padding=1, stride=2)  # 12x12x32->6x6x64
+        self.fc = nn.Linear(2304, 512)
+        self.head_action = nn.Linear(512, 3)
+        self.head_action_std = nn.Linear(512, 3)
+        # self.log_action_std = nn.parameter.Parameter(torch.zeros(1, 3))
+        self.head_value = nn.Linear(512, 1)
+
+    def forward_backbone(self, x):
+        if x.dim() == 3:
+            x = x.unsqueeze(0)
+        x = self.conv1(x)
+        x = torch.tanh(x)
+        x = self.pool1(x)
+
+        x = self.conv2(x)
+        x = torch.tanh(x)
+
+        x = self.conv3(x)
+        x = torch.tanh(x)
+
+        x = x.view(x.shape[0], -1)
+        x = self.fc(x)
+        x = torch.tanh(x)
+        return x
+
+    def forward_policy(self, feat):
+        mean = F.softplus(self.head_action(feat))+1
+        std = F.softplus(self.head_action_std(feat))+1
+        # mean = self.head_action(feat)
+        # std = torch.exp(self.log_action_std).expand_as(mean)
+        return mean, std
 
 # class CarRacingModel(nn.Module):
 #     def __init__(self) -> None:

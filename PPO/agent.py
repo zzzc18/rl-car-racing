@@ -5,8 +5,8 @@ import torch.nn as nn
 import torchvision
 import gym
 import time
-from network import CarRacingModel
-from torch.distributions import Categorical
+from network import CarRacingModel, CarRacingModelSmooth
+from torch.distributions import Categorical, Normal, Beta
 from replay_buffer import BufferPPO, merge_ppo_replay_buffer, get_ppo_dataloader
 import copy
 
@@ -18,7 +18,7 @@ def get_state(state):
 
 
 class CarRacingAgent(mp.Process):
-    def __init__(self, model, result_queue: mp.Queue, main_event, sub_event, name="", device="cpu", skip_frames=2) -> None:
+    def __init__(self, model, result_queue: mp.Queue, main_event, sub_event, name="", device="cpu", skip_frames=0) -> None:
         super().__init__()
         self.model: CarRacingModel = model
         self.result_queue = result_queue
@@ -31,33 +31,38 @@ class CarRacingAgent(mp.Process):
     def update_state_dict(self, state_dict):
         self.model.load_state_dict(state_dict)
 
-    def sample(self, state, requires_grad=True, EPS=0.2):
+    def sample(self, state):
         state = state.to(self.device)
-        if requires_grad:
-            feature = self.model.forward_backbone(state)
-            action_logits = self.model.head_action(feature)
-            value = self.model.head_value(feature)
+
+        if type(self.model) == CarRacingModelSmooth:
+            with torch.no_grad():
+                feature = self.model.forward_backbone(state)
+                mean, std = self.model.forward_policy(feature)
+                value = self.model.head_value(feature).squeeze(-1)
+            # action_dist = Normal(mean, std)
+            action_dist = Beta(mean, std)
+            action = action_dist.sample()
+            action_log_prob = action_dist.log_prob(action).sum()
+            action = action.reshape(-1)
+            action[0] = (action[0]-0.5)*2
+
+            return value, action.reshape(-1).cpu().numpy(), action_log_prob
         else:
             with torch.no_grad():
                 feature = self.model.forward_backbone(state)
                 action_logits = self.model.head_action(feature)
                 value = self.model.head_value(feature).squeeze(-1)
+            action_dist = Categorical(logits=action_logits)
+            action = action_dist.sample()
+            action_log_prob = action_dist.log_prob(action)
 
-        action_dist = Categorical(logits=action_logits)
-        action = action_dist.sample()
-        # if random.random() < EPS:
-        #     action = torch.tensor(random.randint(0, 4)).to(action_logits.device)
-        # else:
-        #     action = torch.argmax(action_logits)
-        action_log_prob = action_dist.log_prob(action)
-
-        return value, action.item(), action_log_prob
+            return value, action.item(), action_log_prob
 
     def run(self):
         self.env = gym.make("CarRacing-v2", render_mode="state_pixels",
-                            domain_randomize=False, continuous=False)
+                            domain_randomize=False, continuous=type(self.model) == CarRacingModelSmooth)
         # self.env = gym.make("CarRacing-v2", render_mode="human",
-        #                     domain_randomize=False, continuous=False)
+        #                     domain_randomize=False, continuous=type(self.model) == CarRacingModelSmooth)
         state, _ = self.env.reset()
         state = get_state(state)
 
@@ -73,7 +78,7 @@ class CarRacingAgent(mp.Process):
             self.buffer.clear()
 
             for step in range(step_length):
-                value, action, action_log_prob = self.sample(state, requires_grad=False)
+                value, action, action_log_prob = self.sample(state)
 
                 reward = 0
                 for _ in range(self.skip_frames+1):
@@ -86,8 +91,8 @@ class CarRacingAgent(mp.Process):
                         break
 
                 # If continually getting negative reward 10 times after the tolerance steps, terminate this episode
-                negative_reward_counter = negative_reward_counter + 1 if time_frame_counter > 40 and reward < 0 else 0
-                terminate = terminate or negative_reward_counter >= 15
+                negative_reward_counter = negative_reward_counter + 1 if time_frame_counter > 100 and reward < 0 else 0
+                terminate = terminate or negative_reward_counter >= 25
 
                 self.buffer.append(state, torch.tensor(action), action_log_prob,
                                    torch.tensor(reward), torch.tensor(int(terminate)), value)

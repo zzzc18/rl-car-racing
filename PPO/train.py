@@ -1,4 +1,4 @@
-from statistics import mode
+import numpy as np
 import torch.multiprocessing as mp
 from tensorboardX import SummaryWriter
 import torch
@@ -8,13 +8,15 @@ import torch.nn.functional as F
 import torchvision
 from replay_buffer import ReplayBuffer
 import pygame
-from torch.distributions import Categorical
+from torch.distributions import Categorical, Normal, Beta
 
-from network import CarRacingModel
+from network import CarRacingModel, CarRacingModelSmooth
 from agent import CarRacingAgent, get_state
 from replay_buffer import BufferPPO, merge_ppo_replay_buffer, get_ppo_dataloader
 import copy
 import gym
+
+SMOOTH = True
 
 total_frames = int(2E7)
 # total_frames = 2000
@@ -49,14 +51,25 @@ def train(model: nn.Module, optimizer: torch.optim.Optimizer, dataloader, writer
             state, old_action, old_action_log_prob, reward, termination, advantage_value, return_value = data
 
             feature = model.forward_backbone(state)
-            action_logits = model.head_action(feature)
             value = model.head_value(feature)
             # action_logits = model.forward_policy(state)
             # value = model.forward_value(state)
 
-            action_dist = Categorical(logits=action_logits)
-            action_log_prob = action_dist.log_prob(old_action)
-            action_entropy = action_dist.entropy()
+            if type(model) == CarRacingModelSmooth:
+                mean, std = model.forward_policy(feature)
+                # action_dist = Normal(mean, std)
+                action_dist = Beta(mean, std)
+                rev_mean = torch.tensor([[.5, .0, .0]]).cuda()
+                rev_std = torch.tensor([[2.0, 1.0, 1.0]]).cuda()
+                old_action = old_action/rev_std+rev_mean
+                action_log_prob = action_dist.log_prob(old_action).sum(dim=1)
+                # action_log_prob = action_dist.log_prob(old_action).sum(dim=1)  # sum of log prob->mul of prob
+                action_entropy = action_dist.entropy().sum(dim=1)
+            else:
+                action_logits = model.head_action(feature)
+                action_dist = Categorical(logits=action_logits)
+                action_log_prob = action_dist.log_prob(old_action)
+                action_entropy = action_dist.entropy()
 
             # loss_clip
             ratio = torch.exp(action_log_prob - old_action_log_prob.squeeze(-1))
@@ -94,13 +107,21 @@ def train(model: nn.Module, optimizer: torch.optim.Optimizer, dataloader, writer
 def eval_sample(model: nn.Module, state):
     with torch.no_grad():
         feature = model.forward_backbone(state)
-        action_logits = model.head_action(feature)
+        # action_logits = model.head_action(feature)
+        mean, std = model.forward_policy(feature)
 
     # action_dist = Categorical(logits=action_logits)
     # print(action_dist.probs)
     # action = action_dist.sample().item()
 
-    action = torch.argmax(action_logits).item()
+    if type(model) == CarRacingModelSmooth:
+        action = mean / (mean + std)
+        action = torch.clamp(action, min=0, max=1)
+        action = action.reshape(-1).cpu().numpy()
+        action[0] = (action[0]-0.5)*2
+        # action = action_logits.reshape(-1).cpu().numpy()
+    else:
+        action = torch.argmax(action_logits).item()
     return action
 
 
@@ -108,7 +129,7 @@ def eval(model: nn.Module):
     model.eval()
 
     env = gym.make("CarRacing-v2", render_mode="human",
-                   domain_randomize=False, continuous=False)
+                   domain_randomize=False, continuous=SMOOTH)
     state, _ = env.reset()
     state = get_state(state)
 
@@ -141,7 +162,10 @@ if __name__ == "__main__":
     writer = SummaryWriter(flush_secs=2)
     torch.multiprocessing.set_start_method("spawn")
 
-    model = CarRacingModel()
+    if SMOOTH:
+        model = CarRacingModelSmooth()
+    else:
+        model = CarRacingModel()
     model.share_memory()
     model = model.cuda()
 
@@ -190,10 +214,19 @@ if __name__ == "__main__":
 
         if train_step % 5 == 0:
             eval_reward = eval(model)
+            print(eval_reward)
             writer.add_scalar("eval_reward", eval_reward, train_step)
             if best_eval_reward < eval_reward:
                 best_eval_reward = eval_reward
-                torch.save(model.state_dict(), "ckpt/ckpt.pt")
+                if type(model) == CarRacingModelSmooth:
+                    torch.save(model.state_dict(), "ckpt_smooth/ckpt_best.pt")
+                else:
+                    torch.save(model.state_dict(), "ckpt/ckpt.pt")
+            else:
+                if type(model) == CarRacingModelSmooth:
+                    torch.save(model.state_dict(), "ckpt_smooth/ckpt_last.pt")
+                else:
+                    torch.save(model.state_dict(), "ckpt/ckpt_last.pt")
 
     for i in range(nprocs):
         process_pool[i].terminate()

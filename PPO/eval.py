@@ -10,7 +10,7 @@ from replay_buffer import ReplayBuffer
 import pygame
 from torch.distributions import Categorical
 
-from network import CarRacingModel
+from network import CarRacingModel, CarRacingModelSmooth
 from agent import CarRacingAgent, get_state
 from replay_buffer import BufferPPO, merge_ppo_replay_buffer, get_ppo_dataloader
 import copy
@@ -100,7 +100,10 @@ def eval_sample(model: nn.Module, state):
     # print(action_dist.probs)
     # action = action_dist.sample().item()
 
-    action = torch.argmax(action_logits).item()
+    if type(model) == CarRacingModelSmooth:
+        action = action_logits.reshape(-1).cpu().numpy()
+    else:
+        action = torch.argmax(action_logits).item()
     return action
 
 
@@ -108,7 +111,7 @@ def eval(model: nn.Module):
     model.eval()
 
     env = gym.make("CarRacing-v2", render_mode="human",
-                   domain_randomize=False, continuous=False)
+                   domain_randomize=False, continuous=True)
     state, _ = env.reset()
     state = get_state(state)
 
@@ -138,9 +141,17 @@ def eval(model: nn.Module):
 
 
 if __name__ == "__main__":
-    model = CarRacingModel()
-    model.load_state_dict(torch.load("ckpt/ckpt.pt"))
+    SMOOTH = True
+    if SMOOTH:
+        model = CarRacingModelSmooth()
+    else:
+        model = CarRacingModel()
     model = model.cuda()
+
+    if type(model) == CarRacingModelSmooth:
+        model.load_state_dict(torch.load("ckpt_smooth/ckpt_best.pt"))
+    else:
+        model.load_state_dict(torch.load("ckpt/ckpt.pt"))
 
     eval_reward = eval(model)
     print(f"eval_reward: {eval_reward}")
